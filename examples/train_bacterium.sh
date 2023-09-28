@@ -1,0 +1,1 @@
+mpiexec -np 5 python main_bacterium.py --scenario-name="RL"

@@ -1,0 +1,223 @@
+#!/usr/bin/env python 
+from os.path import dirname, join, abspath
+
+import os
+from pyrep.envs.bacterium_environment_mpi_mg import Drone_Env
+from pyrep.common.arguments import get_args
+from mpi4py import MPI
+from pyrep.policies.maddpg_drone_att_mg import MADDPG
+# from pyrep.policies.maddpg_drone_scratch import MADDPG
+from pyrep.common.replay_buffer import Buffer
+import numpy as np
+from tensorboardX import SummaryWriter
+import torch
+
+def generate_actions(args,rank,state_list,policy_c,noise,epsilon,logger):
+    #state_list n_env*[n,sdim]---> n_env*[n,adim]
+    if rank == 0:
+        sc = [[] for _ in range(state_list[0].shape[0])]
+        for _,sl in enumerate(state_list):
+            for j in range(state_list[0].shape[0]):           
+                sc[j].append(sl[j,:])
+        sc = [torch.tensor(sci,dtype=torch.float32) for sci in sc] #n*[n_env,sdim]
+        with torch.no_grad():
+            actions = []
+            for i,policy in enumerate(policy_c):
+                action = policy.select_action(sc[i], noise, epsilon,args.use_gpu,logger) 
+                actions.append(action)               
+        #n*[n_env,adim]
+        # print(actions)
+        ac = [[] for _ in range(len(state_list))]
+        for _,al in enumerate(actions):
+            for j in range(actions[0].shape[0]): 
+                # print(al.shape)          
+                ac[j].append(al[j,:])
+        ac = [np.array(aci) for aci in ac] #n_env*[n,adim]
+    else:
+        ac = None
+    return ac
+
+def run(args, env, agents,rank,comm):
+    noise = args.noise_rate
+    epsilon = args.epsilon
+    episode_limit = args.max_episode_len
+    max_episodes = args.max_episodes
+    restart_frequency = 1000
+    buffer = Buffer(args)
+    log_path = os.getcwd()+"/log_drone3_MPI_d1_env{}".format(rank)
+    logger = SummaryWriter(logdir=log_path) # used for tensorboard
+
+    for i in range(max_episodes):
+        if ((i%restart_frequency)==0)and(i!=0):
+            env.restart()
+        s = env.reset_world()
+        score = 0
+        if rank == 0:
+            for agent in agents:
+                agent.prep_rollouts(device='cpu')
+        
+        d_sg = 0
+
+        for t in range(episode_limit):
+            state_list = comm.gather(s,root=0)
+            #start = time.time()
+            actions = generate_actions(args, rank,state_list,agents,noise,epsilon,logger)
+            # print(actions)
+            each_action = comm.scatter(actions,root=0)
+            s_next, r, done = env.step(each_action)
+            score += r[0]
+
+            # add transitons in buff and update policy
+            state_next_list = comm.gather(s_next, root=0) # n_env*[n,sdim]
+            r_list = comm.gather(r, root=0)
+            d_sg_list = comm.gather(d_sg, root=0)
+        
+            if rank == 0:
+                for m in range(args.env_size):
+                    if d_sg_list[m]==1:
+                        pass  # do not store bad samples
+                    else:
+                        buffer.store_episode(state_list[m][:args.n_agents],actions[m], r_list[m][:args.n_agents], state_next_list[m][:args.n_agents])
+
+                if buffer.current_size >= args.batch_size:
+                    for agent in agents:
+                        agent.prep_training(device='cpu')
+                    transitions = buffer.sample(args.batch_size)
+                    for agent in agents:
+                        other_agents = agents.copy()
+                        other_agents.remove(agent)
+                        agent.train(transitions,other_agents,logger,args.use_gpu)
+                        agent.prep_rollouts(device='cpu')
+
+            if d_sg == 0:
+                noise = max(0.05, noise - 0.0000005)
+                epsilon = max(0.05, noise - 0.0000005)
+
+            s = s_next
+
+            if rank==0:
+                done_0 = [done]*args.env_size
+            else:
+                done_0 = None
+
+            d_0 = comm.scatter(done_0,root=0)
+
+            
+            if np.any(d_0):
+                break
+
+            if rank:
+                if np.any(done) or d_sg:
+                    d_sg = 1
+               
+
+        logger.add_scalar('mean_episode_rewards{}'.format(rank), score, i)
+        if rank==0:
+            print("episode",i,":",score)
+        # logger.add_scalar('network_loss', loss_sum, i)
+            
+    logger.close()
+    env.shutdown()
+
+def evaluation(args, env, agents):
+    log_path = os.getcwd()+"/log_drone3_MPI_d1_env_eval"
+    logger = SummaryWriter(logdir=log_path) # used for tensorboard
+    returns = []
+    for episode in range(args.evaluate_episodes):
+        # reset the environment
+        s = env.reset_world()
+        rewards = 0
+        for time_step in range(args.evaluate_episode_len):
+            actions = []
+            with torch.no_grad():
+                for agent_id, agent in enumerate(agents):
+                    action = agent.select_action(torch.tensor(s[agent_id], dtype=torch.float32).unsqueeze(0), 0, 0, args.use_gpu, logger) #sc[i], noise, epsilon,args.use_gpu,logger
+                    actions.append(action[0,:])
+            actions = np.array(actions)
+            # print(actions.shape)
+            s_next, r, done = env.step(actions)
+            rewards += r[0]
+            s = s_next
+            if np.any(done):
+                break
+        returns.append(rewards)
+        print('Returns is', rewards)
+
+    return sum(returns) / args.evaluate_episodes  
+
+if __name__ == '__main__':
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
+    # get the params
+    args = get_args()
+    num_agents = 3
+
+    if num_agents==3:
+        if rank==0:
+            env_name = join(dirname(abspath(__file__)), 'RL_drone_square_three00.ttt')
+        else:
+            env_name = join(dirname(abspath(__file__)), 'RL_drone_square_three{}{}.ttt'.format(rank,rank))
+    if num_agents==6:
+        if rank==0:
+            env_name = join(dirname(abspath(__file__)), 'RL_drone_square_six9.ttt')
+        else:
+            env_name = join(dirname(abspath(__file__)), 'RL_drone_square_six9.ttt')
+    if num_agents==12:
+        if rank==0:
+            env_name = join(dirname(abspath(__file__)), 'RL_drone_square_twe.ttt')
+        else:
+            env_name = join(dirname(abspath(__file__)), 'RL_drone_square_twe{}.ttt'.format(rank))
+
+    # create multiagent environment
+    args.n_agents = num_agents # agent number in a swarm
+    args.n_points = num_agents
+    env = Drone_Env(env_name,num_agents,args.n_points)
+    
+    args.high_action = 1
+    args.max_episodes = 8000 #8000
+    args.max_episode_len = 80 #60
+    # args.n_agents = num_agents # agent number in a swarm
+    # args.n_points = num_agents+2
+    args.evaluate_rate = 10000 
+    args.evaluate = True #
+    args.load_buffer = False
+    args.evaluate_episode_len = 30
+    args.evaluate_episodes = 20
+    args.save_rate = 1000
+    args.obs_shape = [env.observation_space[i].shape[0] for i in range(args.n_agents)]  # observation space
+    # if num_agents == 3:
+    #     # args.save_dir = "./model_drone3_mpi_d1_demowp"
+    #     # args.scenario_name = "navigation_drone3_mpi_d1_demowp"
+    #     args.save_dir = "./model_drone3_mpi_d1_demowpw"
+    #     args.scenario_name = "navigation_drone3_mpi_d1_demowp"
+    if num_agents == 3:
+        args.save_dir = "./model_drone6_mpi_d1_cur2"
+        args.scenario_name = "navigation_drone6_mpi_d1_cur"
+    args.env_size = 2
+    args.use_gpu = False
+    # print(args.obs_shape)
+    # assert(args.obs_shape[0]==82)
+    action_shape = []        
+    for content in env.action_space[:args.n_agents]:
+        action_shape.append(content.shape[0])
+    args.action_shape = action_shape[:args.n_agents]  # action space
+    # print(args.action_shape)
+    assert(args.action_shape[0]==2) 
+
+    if rank==0:
+        agents = [MADDPG(args,i) for i in range(args.n_agents)]
+    else:
+        agents = None
+
+    try:
+        if args.evaluate:
+            if rank == 0:
+                evaluation(args,env,agents)
+        else:
+            run(args, env, agents,rank,comm)
+    except KeyboardInterrupt:
+        env.shutdown()
+
